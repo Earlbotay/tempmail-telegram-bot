@@ -24,8 +24,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 from telegram.constants import ParseMode
 
 # ── Config ──────────────────────────────────────────────────────────────────
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ADMIN_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_CHAT_ID = int(os.environ.get("CHAT_ID", "0"))
 ROTATE_INTERVAL = 300  # 5 minit
 POLL_INTERVAL = 5      # 5 saat
 COUNTDOWN_UPDATE = 30  # update countdown setiap 30 saat
@@ -326,7 +326,7 @@ async def callback_handler(update: Update, context) -> None:
 # ── Main ────────────────────────────────────────────────────────────────────
 async def main() -> None:
     if not TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN not set!")
+        log.error("BOT_TOKEN not set!")
         sys.exit(1)
 
     log.info("Bot starting...")
