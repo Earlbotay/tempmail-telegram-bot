@@ -122,8 +122,34 @@ def format_status(email: str, created_at: float) -> str:
     )
 
 
+def _extract_code(text: str) -> str | None:
+    """Extract OTP / verification code (4-8 digit) dari teks.
+    
+    Cari pattern biasa macam:
+    - 'code is 123456'
+    - 'code: 123456'
+    - 'passcode 862669'
+    - 'PIN: 1234'
+    - standalone 4-8 digit number
+    """
+    import re
+    # Pattern 1: keyword + nombor (paling reliable)
+    kw = r'(?:code|passcode|otp|pin|verification|verify|token|kode|kod)\s*(?:is|:|\s)\s*(\d{4,8})'
+    m = re.search(kw, text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Pattern 2: nombor 4-8 digit yang berdiri sendiri (bukan tahun, bukan phone number)
+    # Elak tahun 19xx/20xx dan nombor > 8 digit
+    for m in re.finditer(r'(?<!\d)(\d{4,8})(?!\d)', text):
+        num = m.group(1)
+        if len(num) == 4 and num[:2] in ("19", "20"):
+            continue  # skip tahun
+        return num
+    return None
+
+
 def format_email_notification(msg: dict) -> str:
-    """Format notifikasi email masuk"""
+    """Format notifikasi email masuk, dengan OTP code senang copy"""
     sender = msg.get("from", "Unknown")
     subject = msg.get("subject", "(Tiada Subjek)")
     # Cuba bodyText dulu, fallback bodyPreview
@@ -133,15 +159,26 @@ def format_email_notification(msg: dict) -> str:
     # Trim body kalau terlalu panjang
     if len(body) > 3000:
         body = body[:3000] + "\n\n... (dipotong)"
-    return (
-        f"<blockquote>"
-        f"📩 <b>Email Baru Diterima!</b>\n\n"
-        f"👤 Dari: {_escape(sender)}\n"
-        f"📋 Subjek: {_escape(subject)}\n\n"
-        f"{'─' * 30}\n"
-        f"{_escape(body)}"
-        f"</blockquote>"
-    )
+
+    # Extract OTP/verification code dari subject + body
+    code = _extract_code(subject + " " + body)
+
+    # Build notification
+    parts = [
+        f"<blockquote>",
+        f"📩 <b>Email Baru Diterima!</b>\n",
+    ]
+    # Kalau ada code, tunjuk besar-besar kat atas senang copy
+    if code:
+        parts.append(f"\n🔑 <b>Kod:</b> <code>{code}</code>\n")
+    parts.extend([
+        f"\n👤 Dari: {_escape(sender)}",
+        f"\n📋 Subjek: {_escape(subject)}\n",
+        f"\n{'─' * 30}",
+        f"\n{_escape(body)}",
+        f"</blockquote>",
+    ])
+    return "".join(parts)
 
 
 def _escape(text: str) -> str:
