@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Temp Mail Bot (scrape web2.temp-mail.org)
-- /start: Buat mailbox baru, papar email + countdown 5 minit
+- /start: Tunjuk email semasa (buat baru kalau belum ada)
 - Auto-rotate email setiap 5 minit
 - Polling inbox setiap 5 saat (berterusan)
 - Butang TUKAR EMAIL (merah/destructive)
@@ -254,7 +254,7 @@ async def background_loop(bot: Bot, chat_id: int) -> None:
 
 # ── Handlers ────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context) -> None:
-    """Handle /start - sentiasa berfungsi"""
+    """Handle /start - tunjuk email semasa, buat baru HANYA kalau belum ada"""
     global bg_task, bot_instance
 
     if not update.effective_chat:
@@ -266,7 +266,19 @@ async def cmd_start(update: Update, context) -> None:
 
     log.info(f"/start dari chat {chat_id}")
 
-    # Cancel background task lama
+    # Kalau dah ada email aktif + background loop masih jalan → tunjuk semula je
+    if current_mailbox and current_token and bg_task and not bg_task.done():
+        log.info(f"Email sedia ada: {current_mailbox}, tunjuk semula")
+        text = format_status(current_mailbox, mail_created_at)
+        kb = make_keyboard()
+        msg = await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        # Update status_message_id supaya countdown update mesej terbaru
+        global status_message_id
+        status_message_id = msg.message_id
+        return
+
+    # Belum ada email / background loop dah mati → buat baru
+    # Cancel background task lama kalau ada
     if bg_task and not bg_task.done():
         bg_task.cancel()
         try:
