@@ -1,423 +1,442 @@
 #!/usr/bin/env python3
 """
-Telegram Temp Mail Bot
+Telegram Temp Mail Bot (temp-mail.org API)
 - /start: Papar temp mail semasa dengan countdown 5 minit
 - Auto-rotate email setiap 5 minit
-- Auto-check inbox setiap saat (polling berterusan)
-- Butang Delete & Tukar Email (MERAH - style:"danger" Bot API 9.4)
-- Dedup inbox: ingat semua email untuk session semasa sahaja
+- Polling inbox berterusan (setiap 5 saat)
+- Butang Delete (MERAH - style:"destructive" Bot API 9.4)
+- Dedup 100%: ingat mail_unique_id untuk email semasa sahaja
 - Semua mesej dalam <blockquote> HTML
-- Dijalankan di GitHub Actions (cron 5 jam)
+- GitHub Actions: cron 5 jam, auto-cancel run lama
 """
 
 import os
 import sys
 import re
 import time
+import hashlib
 import signal
 import asyncio
 import logging
-import html as html_mod
-from datetime import datetime, timezone
+import html
+import random
+import string
+from datetime import datetime, timezone, timedelta
 
 import httpx
 
 # ─── CONFIG ───
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-API_TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
-API_MAIL = "https://api.guerrillamail.com/ajax.php"
-ROTATE_INTERVAL = 300  # 5 minit
-INBOX_POLL_INTERVAL = 5  # 5 saat - poll inbox berterusan
-COUNTDOWN_UPDATE_INTERVAL = 30  # Update countdown display setiap 30s
-MAX_RUNTIME = 5 * 3600 - 120  # 4h58m
+if not BOT_TOKEN:
+    print("FATAL: BOT_TOKEN not set")
+    sys.exit(1)
 
-# ─── LOGGING ───
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TEMPMAIL_API = "https://api.temp-mail.org/request"
+
+ROTATE_INTERVAL = 300  # 5 minit
+INBOX_POLL_INTERVAL = 5  # setiap 5 saat
+MAX_RUNTIME = 4 * 3600 + 58 * 60  # 4 jam 58 minit
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("tempmail-bot")
 
-# ─── STATE ───
-state = {
-    "sid_token": None,
-    "email": None,
-    "rotate_at": 0,
-    "chat_ids": set(),
-    # Dedup: set of (mail_from, mail_subject, mail_excerpt) tuples
-    # Hanya untuk email semasa - reset bila tukar email
-    "seen_signatures": set(),
-    "seen_mail_ids": set(),
-    "msg_ids": {},  # chat_id -> message_id for edit
-    "running": True,
-    "offset": 0,
-}
+shutdown_event = asyncio.Event()
 
 
-# ═══════════════════════════════════════════
-#  GUERRILLAMAIL API
-# ═══════════════════════════════════════════
-async def mail_api(client: httpx.AsyncClient, params: dict) -> dict:
-    if state["sid_token"]:
-        params["sid_token"] = state["sid_token"]
-    try:
-        resp = await client.get(API_MAIL, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        if "sid_token" in data:
-            state["sid_token"] = data["sid_token"]
-        return data
-    except httpx.TimeoutException:
-        log.warning("Mail API timeout")
-        return {}
-    except httpx.HTTPStatusError as e:
-        log.warning(f"Mail API HTTP {e.response.status_code}")
-        return {}
-    except Exception as e:
-        log.error(f"Mail API error: {e}")
-        return {}
+# ─── STATE PER USER ───
+class UserState:
+    __slots__ = ("email", "email_md5", "created_at", "seen_ids", "last_start_msg_id", "domain")
+
+    def __init__(self):
+        self.email: str = ""
+        self.email_md5: str = ""
+        self.created_at: float = 0.0
+        self.seen_ids: set = set()
+        self.last_start_msg_id: int = 0
+        self.domain: str = ""
 
 
-async def get_new_email(client: httpx.AsyncClient) -> str:
-    """Dapatkan email baru. Reset dedup untuk session baru."""
-    # Forget session lama
-    if state["sid_token"]:
+users: dict[int, UserState] = {}
+
+
+def get_user(chat_id: int) -> UserState:
+    if chat_id not in users:
+        users[chat_id] = UserState()
+    return users[chat_id]
+
+
+# ─── TELEGRAM HELPERS ───
+async def tg(client: httpx.AsyncClient, method: str, **kwargs) -> dict | None:
+    for attempt in range(3):
         try:
-            await mail_api(client, {"f": "forget_me"})
-        except Exception:
-            pass
-        state["sid_token"] = None
-
-    data = await mail_api(client, {"f": "get_email_address"})
-    email = data.get("email_addr", "")
-    if not email:
-        log.error("Gagal dapatkan email baru, cuba lagi...")
-        await asyncio.sleep(2)
-        data = await mail_api(client, {"f": "get_email_address"})
-        email = data.get("email_addr", "error@unknown")
-
-    state["email"] = email
-    state["rotate_at"] = time.time() + ROTATE_INTERVAL
-    # RESET dedup - hanya ingat email untuk session semasa
-    state["seen_signatures"] = set()
-    state["seen_mail_ids"] = set()
-    log.info(f"Email baru: {email}")
-    return email
+            r = await client.post(f"{TG_API}/{method}", json=kwargs, timeout=30)
+            data = r.json()
+            if data.get("ok"):
+                return data.get("result")
+            err = data.get("description", "")
+            # Rate limit
+            if r.status_code == 429:
+                retry = data.get("parameters", {}).get("retry_after", 3)
+                log.warning("Rate limited, wait %ss", retry)
+                await asyncio.sleep(retry)
+                continue
+            log.error("TG %s fail: %s", method, err)
+            return None
+        except Exception as e:
+            log.error("TG %s error (attempt %d): %s", method, attempt + 1, e)
+            await asyncio.sleep(2)
+    return None
 
 
-async def check_inbox(client: httpx.AsyncClient) -> list:
-    """Semak inbox. Return hanya email BARU yang belum pernah dilihat."""
-    data = await mail_api(client, {"f": "check_email", "seq": "0"})
-    all_emails = data.get("list", [])
-    if not isinstance(all_emails, list):
+async def answer_cb(client: httpx.AsyncClient, cb_id: str, text: str = ""):
+    await tg(client, "answerCallbackQuery", callback_query_id=cb_id, text=text)
+
+
+# ─── TEMP-MAIL.ORG API ───
+_domains_cache: list[str] = []
+
+
+async def get_domains(client: httpx.AsyncClient) -> list[str]:
+    global _domains_cache
+    if _domains_cache:
+        return _domains_cache
+    for attempt in range(3):
+        try:
+            r = await client.get(f"{TEMPMAIL_API}/domains/format/json/", timeout=15)
+            if r.status_code == 200:
+                domains = r.json()
+                if isinstance(domains, list) and domains:
+                    _domains_cache = domains
+                    log.info("Domains loaded: %s", domains)
+                    return domains
+        except Exception as e:
+            log.error("get_domains attempt %d: %s", attempt + 1, e)
+            await asyncio.sleep(2)
+    return []
+
+
+def generate_username(length: int = 10) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+async def create_email(client: httpx.AsyncClient) -> tuple[str, str, str]:
+    """Return (email, md5_hash, domain) or ("","","") on failure."""
+    domains = await get_domains(client)
+    if not domains:
+        return "", "", ""
+    domain = random.choice(domains)
+    username = generate_username()
+    email = f"{username}{domain}"
+    md5 = hashlib.md5(email.lower().encode()).hexdigest()
+    log.info("Created email: %s (md5: %s)", email, md5)
+    return email, md5, domain
+
+
+async def check_inbox(client: httpx.AsyncClient, md5: str) -> list[dict]:
+    try:
+        r = await client.get(f"{TEMPMAIL_API}/mail/id/{md5}/format/json/", timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                return data
+        # 404 = no messages
+        return []
+    except Exception as e:
+        log.error("check_inbox error: %s", e)
         return []
 
-    new_emails = []
-    for em in all_emails:
-        mail_id = str(em.get("mail_id", ""))
-        # Dedup by mail_id
-        if mail_id in state["seen_mail_ids"]:
-            continue
-        # Dedup by content signature (100% match check)
-        sig = (
-            str(em.get("mail_from", "")).strip().lower(),
-            str(em.get("mail_subject", "")).strip().lower(),
-            str(em.get("mail_excerpt", "")).strip().lower(),
-            str(em.get("mail_timestamp", "")),
-        )
-        if sig in state["seen_signatures"]:
-            continue
-        # Email ni baru!
-        state["seen_mail_ids"].add(mail_id)
-        state["seen_signatures"].add(sig)
-        new_emails.append(em)
 
-    return new_emails
+# ─── FORMAT HELPERS ───
+def escape(text: str) -> str:
+    return html.escape(str(text)) if text else ""
 
 
-async def fetch_email_body(client: httpx.AsyncClient, mail_id: str) -> str:
-    """Baca email penuh, bersihkan HTML."""
-    data = await mail_api(client, {"f": "fetch_email", "email_id": mail_id})
-    raw = data.get("mail_body", "")
-    # Bersihkan HTML
-    clean = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
-    clean = re.sub(r"<[^>]+>", "", clean)
-    clean = clean.strip()
-    if len(clean) > 1500:
-        clean = clean[:1500] + "..."
-    return html_mod.escape(clean) if clean else "(Tiada kandungan)"
+def time_left_str(created_at: float) -> str:
+    elapsed = time.time() - created_at
+    remaining = max(0, ROTATE_INTERVAL - elapsed)
+    mins = int(remaining) // 60
+    secs = int(remaining) % 60
+    return f"{mins}m {secs:02d}s"
 
 
-# ═══════════════════════════════════════════
-#  TELEGRAM API
-# ═══════════════════════════════════════════
-async def tg(client: httpx.AsyncClient, method: str, data: dict = None) -> dict:
-    try:
-        resp = await client.post(f"{API_TG}/{method}", json=data or {}, timeout=30)
-        result = resp.json()
-        if not result.get("ok"):
-            desc = result.get("description", "unknown")
-            # Jangan spam log untuk "message is not modified"
-            if "message is not modified" not in desc:
-                log.warning(f"TG {method}: {desc}")
-        return result
-    except httpx.TimeoutException:
-        log.warning(f"TG {method} timeout")
-        return {"ok": False}
-    except Exception as e:
-        log.error(f"TG {method} error: {e}")
-        return {"ok": False}
-
-
-def build_main_message() -> str:
-    email = state["email"] or "Memuat..."
-    remaining = max(0, int(state["rotate_at"] - time.time()))
-    mins = remaining // 60
-    secs = remaining % 60
-
-    e = html_mod.escape(email)
-
+def make_start_text(state: UserState) -> str:
+    tl = time_left_str(state.created_at)
     return (
-        f"<blockquote>"
-        f"<b>Temp Mail Bot</b>\n\n"
-        f"Email semasa:\n"
-        f"<code>{e}</code>\n\n"
-        f"Auto-tukar dalam: <b>{mins}m {secs:02d}s</b>\n\n"
-        f"Email ini ditukar automatik setiap 5 minit.\n"
-        f"Tekan butang di bawah untuk tukar segera."
-        f"</blockquote>"
+        f"<blockquote><b>Temporary Email</b>\n\n"
+        f"<code>{escape(state.email)}</code>\n\n"
+        f"Auto-tukar dalam: <b>{tl}</b></blockquote>"
     )
 
 
-def build_keyboard() -> dict:
-    """
-    Inline keyboard: butang DELETE & TUKAR EMAIL (MERAH)
-    Guna style: "danger" dari Bot API 9.4 (Feb 2026)
-    """
+def make_delete_keyboard():
+    """Butang DELETE MERAH guna style:'destructive' (Bot API 9.4)"""
     return {
         "inline_keyboard": [
             [
                 {
-                    "text": "DELETE & TUKAR EMAIL",
+                    "text": "Delete & Tukar Email",
                     "callback_data": "delete_email",
-                    "style": "danger",  # Bot API 9.4 - MERAH
+                    "style": "destructive",
                 }
-            ],
+            ]
         ]
     }
 
 
-async def send_or_update_main(client: httpx.AsyncClient, chat_id: int) -> None:
-    """Hantar atau edit mesej utama."""
-    text = build_main_message()
-    kb = build_keyboard()
+def format_email_msg(mail: dict) -> str:
+    sender = escape(mail.get("mail_from", "Unknown"))
+    subject = escape(mail.get("mail_subject", "(No Subject)"))
+    preview = escape(mail.get("mail_preview", ""))
+    text_body = mail.get("mail_text_only") or mail.get("mail_text") or ""
+    # Truncate long bodies
+    if len(text_body) > 1500:
+        text_body = text_body[:1500] + "..."
+    text_body = escape(text_body)
 
-    old_msg = state["msg_ids"].get(chat_id)
-    if old_msg:
-        result = await tg(client, "editMessageText", {
-            "chat_id": chat_id,
-            "message_id": old_msg,
-            "text": text,
-            "parse_mode": "HTML",
-            "reply_markup": kb,
-        })
-        if result.get("ok"):
-            return
-        # Gagal edit (mesej dah lama/delete) - hantar baru
-
-    result = await tg(client, "sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "reply_markup": kb,
-    })
-    if result.get("ok"):
-        state["msg_ids"][chat_id] = result["result"]["message_id"]
-
-
-async def notify_new_email(client: httpx.AsyncClient, em: dict) -> None:
-    """Hantar notifikasi email baru ke semua user."""
-    sender = html_mod.escape(str(em.get("mail_from", "Unknown")))
-    subject = html_mod.escape(str(em.get("mail_subject", "No Subject")))
-
-    mail_id = str(em.get("mail_id", ""))
-    body = "(Tiada kandungan)"
-    if mail_id:
-        body = await fetch_email_body(client, mail_id)
-
-    text = (
-        f"<blockquote>"
-        f"<b>EMAIL BARU MASUK!</b>\n\n"
-        f"Dari: <b>{sender}</b>\n"
-        f"Subjek: <b>{subject}</b>\n\n"
-        f"Kandungan:\n{body}"
-        f"</blockquote>"
+    return (
+        f"<blockquote><b>Email Baru Diterima!</b>\n\n"
+        f"<b>Dari:</b> {sender}\n"
+        f"<b>Subjek:</b> {subject}\n"
+        f"<b>Preview:</b> {preview}\n\n"
+        f"<b>Isi:</b>\n{text_body}</blockquote>"
     )
 
-    for chat_id in list(state["chat_ids"]):
-        await tg(client, "sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-        })
+
+# ─── CORE: ASSIGN EMAIL TO USER ───
+async def assign_new_email(client: httpx.AsyncClient, chat_id: int) -> bool:
+    state = get_user(chat_id)
+    email, md5, domain = await create_email(client)
+    if not email:
+        await tg(
+            client,
+            "sendMessage",
+            chat_id=chat_id,
+            text="<blockquote>Gagal dapatkan email. Cuba lagi sebentar.</blockquote>",
+            parse_mode="HTML",
+        )
+        return False
+    state.email = email
+    state.email_md5 = md5
+    state.domain = domain
+    state.created_at = time.time()
+    state.seen_ids = set()  # Reset dedup untuk email baru
+    return True
 
 
-async def notify_rotation(client: httpx.AsyncClient, old_email: str) -> None:
-    """Notify semua user tentang email rotation."""
-    text = (
-        f"<blockquote>"
-        f"<b>Email ditukar automatik!</b>\n\n"
-        f"Lama: <s>{html_mod.escape(old_email)}</s>\n"
-        f"Baru: <code>{html_mod.escape(state['email'])}</code>"
-        f"</blockquote>"
+async def send_start_message(client: httpx.AsyncClient, chat_id: int):
+    state = get_user(chat_id)
+    text = make_start_text(state)
+    kb = make_delete_keyboard()
+    result = await tg(
+        client,
+        "sendMessage",
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=kb,
     )
-    for chat_id in list(state["chat_ids"]):
-        await tg(client, "sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-        })
-        await send_or_update_main(client, chat_id)
+    if result:
+        state.last_start_msg_id = result.get("message_id", 0)
 
 
-# ═══════════════════════════════════════════
-#  UPDATE HANDLER
-# ═══════════════════════════════════════════
-async def handle_updates(client: httpx.AsyncClient) -> None:
-    result = await tg(client, "getUpdates", {
-        "offset": state["offset"],
-        "timeout": 1,
-        "allowed_updates": ["message", "callback_query"],
-    })
+# ─── HANDLE /start ───
+async def handle_start(client: httpx.AsyncClient, chat_id: int):
+    state = get_user(chat_id)
+    # Sentiasa buat email baru bila /start
+    ok = await assign_new_email(client, chat_id)
+    if ok:
+        await send_start_message(client, chat_id)
 
-    if not result.get("ok"):
+
+# ─── HANDLE CALLBACK (DELETE) ───
+async def handle_callback(client: httpx.AsyncClient, cb: dict):
+    cb_id = cb.get("id", "")
+    data = cb.get("data", "")
+    msg = cb.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+
+    if not chat_id:
+        await answer_cb(client, cb_id, "Error")
         return
 
-    for update in result.get("result", []):
-        state["offset"] = update["update_id"] + 1
+    if data == "delete_email":
+        await answer_cb(client, cb_id, "Memadam & menukar email...")
+        # Delete old start message button (edit to remove keyboard)
+        old_msg_id = msg.get("message_id")
+        if old_msg_id:
+            state = get_user(chat_id)
+            old_email = escape(state.email)
+            await tg(
+                client,
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=old_msg_id,
+                text=f"<blockquote><s>{old_email}</s>\n<i>Dipadam</i></blockquote>",
+                parse_mode="HTML",
+            )
+        ok = await assign_new_email(client, chat_id)
+        if ok:
+            await send_start_message(client, chat_id)
 
+
+# ─── POLLING: TELEGRAM UPDATES ───
+async def poll_updates(client: httpx.AsyncClient):
+    offset = 0
+    while not shutdown_event.is_set():
         try:
-            # ─── /start ───
-            msg = update.get("message", {})
-            text = msg.get("text", "")
-            if text.startswith("/start"):
-                chat_id = msg["chat"]["id"]
-                state["chat_ids"].add(chat_id)
-                log.info(f"/start dari chat_id={chat_id}")
-
-                # Sentiasa berfungsi: kalau belum ada email, dapatkan baru
-                if not state["email"]:
-                    await get_new_email(client)
-                await send_or_update_main(client, chat_id)
-
-            # ─── Callback: Delete & Tukar ───
-            cb = update.get("callback_query")
-            if cb:
-                cb_data = cb.get("data", "")
-                cb_id = cb["id"]
-                chat_id = cb["message"]["chat"]["id"]
-                state["chat_ids"].add(chat_id)
-
-                if cb_data == "delete_email":
-                    await tg(client, "answerCallbackQuery", {
-                        "callback_query_id": cb_id,
-                        "text": "Memadam & menukar email...",
-                        "show_alert": False,
-                    })
-                    old = state["email"]
-                    await get_new_email(client)
-                    await notify_rotation(client, old or "")
-
+            r = await client.get(
+                f"{TG_API}/getUpdates",
+                params={"offset": offset, "timeout": 10, "allowed_updates": '["message","callback_query"]'},
+                timeout=15,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                await asyncio.sleep(2)
+                continue
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                # Handle /start
+                msg = update.get("message")
+                if msg:
+                    text = msg.get("text", "")
+                    chat_id = msg.get("chat", {}).get("id")
+                    if chat_id and text.strip().lower() in ("/start", "/start@"):
+                        asyncio.create_task(handle_start(client, chat_id))
+                # Handle callback
+                cb = update.get("callback_query")
+                if cb:
+                    asyncio.create_task(handle_callback(client, cb))
+        except httpx.ReadTimeout:
+            continue
         except Exception as e:
-            log.error(f"Handle update error: {e}")
+            log.error("poll_updates error: %s", e)
+            await asyncio.sleep(3)
 
 
-# ═══════════════════════════════════════════
-#  MAIN LOOP
-# ═══════════════════════════════════════════
-async def main():
-    log.info("=" * 50)
-    log.info("  TEMP MAIL TELEGRAM BOT - STARTING")
-    log.info("=" * 50)
-
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN not set!")
-        sys.exit(1)
-
-    start_time = time.time()
-    last_inbox_check = 0
-    last_countdown_update = 0
-
-    async with httpx.AsyncClient() as client:
-        # Email pertama
-        await get_new_email(client)
-        log.info(f"Bot started: {state['email']}")
-
-        # Set bot commands
-        await tg(client, "setMyCommands", {
-            "commands": [{"command": "start", "description": "Dapatkan Temp Mail"}]
-        })
-
-        # Clear pending updates
-        await tg(client, "getUpdates", {"offset": -1, "timeout": 0})
-        state["offset"] = 0
-
-        while state["running"]:
+# ─── POLLING: INBOX CHECK ───
+async def poll_inbox(client: httpx.AsyncClient):
+    while not shutdown_event.is_set():
+        await asyncio.sleep(INBOX_POLL_INTERVAL)
+        for chat_id, state in list(users.items()):
+            if not state.email_md5:
+                continue
             try:
-                now = time.time()
-
-                # Runtime limit (GitHub Actions safety)
-                if now - start_time >= MAX_RUNTIME:
-                    log.info("Runtime limit. Shutting down.")
-                    for cid in list(state["chat_ids"]):
-                        await tg(client, "sendMessage", {
-                            "chat_id": cid,
-                            "text": "<blockquote><b>Bot sedang restart...</b>\nSila tunggu sebentar.</blockquote>",
-                            "parse_mode": "HTML",
-                        })
-                    break
-
-                # 1. Handle Telegram updates (sentiasa responsive)
-                await handle_updates(client)
-
-                # 2. Auto-rotate email setiap 5 minit
-                if now >= state["rotate_at"] and state["email"]:
-                    log.info("Auto-rotate email...")
-                    old = state["email"]
-                    await get_new_email(client)
-                    await notify_rotation(client, old)
-
-                # 3. Inbox polling berterusan (setiap 5 saat)
-                if now - last_inbox_check >= INBOX_POLL_INTERVAL and state["email"]:
-                    last_inbox_check = now
-                    new_emails = await check_inbox(client)
-                    for em in new_emails:
-                        log.info(f"Email baru: {em.get('mail_subject', '?')}")
-                        await notify_new_email(client, em)
-
-                # 4. Update countdown display setiap 30 saat
-                if now - last_countdown_update >= COUNTDOWN_UPDATE_INTERVAL and state["chat_ids"]:
-                    last_countdown_update = now
-                    for cid in list(state["chat_ids"]):
-                        await send_or_update_main(client, cid)
-
-                await asyncio.sleep(1)
-
+                mails = await check_inbox(client, state.email_md5)
+                for mail in mails:
+                    uid = mail.get("mail_unique_id", "")
+                    if not uid:
+                        continue
+                    # Dedup: skip kalau dah nampak
+                    if uid in state.seen_ids:
+                        continue
+                    state.seen_ids.add(uid)
+                    text = format_email_msg(mail)
+                    await tg(client, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
             except Exception as e:
-                log.error(f"Main loop error: {e}")
-                await asyncio.sleep(3)
-
-    log.info("Bot shutdown complete.")
+                log.error("poll_inbox error for %d: %s", chat_id, e)
 
 
-# ─── SIGNAL HANDLERS ───
-def shutdown(sig, frame):
-    log.info(f"Signal {sig}. Shutting down...")
-    state["running"] = False
+# ─── AUTO-ROTATE EMAIL SETIAP 5 MINIT ───
+async def auto_rotate(client: httpx.AsyncClient):
+    while not shutdown_event.is_set():
+        await asyncio.sleep(15)  # Check setiap 15 saat
+        now = time.time()
+        for chat_id, state in list(users.items()):
+            if not state.email:
+                continue
+            elapsed = now - state.created_at
+            if elapsed >= ROTATE_INTERVAL:
+                log.info("Auto-rotate for chat %d", chat_id)
+                old_email = escape(state.email)
+                # Edit old message
+                if state.last_start_msg_id:
+                    await tg(
+                        client,
+                        "editMessageText",
+                        chat_id=chat_id,
+                        message_id=state.last_start_msg_id,
+                        text=f"<blockquote><s>{old_email}</s>\n<i>Tamat tempoh (5 minit)</i></blockquote>",
+                        parse_mode="HTML",
+                    )
+                ok = await assign_new_email(client, chat_id)
+                if ok:
+                    await send_start_message(client, chat_id)
 
-signal.signal(signal.SIGTERM, shutdown)
-signal.signal(signal.SIGINT, shutdown)
+
+# ─── COUNTDOWN UPDATER ───
+async def update_countdown(client: httpx.AsyncClient):
+    """Update countdown text setiap 30 saat."""
+    while not shutdown_event.is_set():
+        await asyncio.sleep(30)
+        for chat_id, state in list(users.items()):
+            if not state.email or not state.last_start_msg_id:
+                continue
+            text = make_start_text(state)
+            kb = make_delete_keyboard()
+            try:
+                await tg(
+                    client,
+                    "editMessageText",
+                    chat_id=chat_id,
+                    message_id=state.last_start_msg_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+            except Exception:
+                pass  # Ignore edit errors (message not modified)
+
+
+# ─── MAIN ───
+async def main():
+    log.info("Bot starting...")
+    start_time = time.time()
+
+    # Delete webhook if any
+    async with httpx.AsyncClient() as client:
+        await tg(client, "deleteWebhook", drop_pending_updates=False)
+
+    async with httpx.AsyncClient(http2=False) as client:
+        # Verify bot
+        me = await tg(client, "getMe")
+        if me:
+            log.info("Bot: @%s", me.get("username", "?"))
+        else:
+            log.error("Cannot connect to Telegram API!")
+            return
+
+        # Launch all tasks
+        tasks = [
+            asyncio.create_task(poll_updates(client)),
+            asyncio.create_task(poll_inbox(client)),
+            asyncio.create_task(auto_rotate(client)),
+            asyncio.create_task(update_countdown(client)),
+        ]
+
+        # Shutdown timer
+        async def shutdown_timer():
+            while not shutdown_event.is_set():
+                await asyncio.sleep(10)
+                if time.time() - start_time >= MAX_RUNTIME:
+                    log.info("Max runtime reached, shutting down...")
+                    shutdown_event.set()
+
+        tasks.append(asyncio.create_task(shutdown_timer()))
+
+        # Signal handler
+        def signal_handler(*_):
+            log.info("Signal received, shutting down...")
+            shutdown_event.set()
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        await shutdown_event.wait()
+        for t in tasks:
+            t.cancel()
+        log.info("Bot stopped.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
